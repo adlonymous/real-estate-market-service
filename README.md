@@ -12,7 +12,7 @@ A DAIN Service AI Agent that extracts highly accurate and precise Real Estate ma
 - Price per sq feet Feed
 - Rental price per sq feet Feed
 
-(soon)
+### Soon
 - Volatility Feed
 - For Sale Inventory
 - New Listings for Rent
