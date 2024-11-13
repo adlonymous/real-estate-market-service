@@ -2,6 +2,7 @@
 
 import { z } from "zod";
 import axios from "axios";
+import { createClient } from 'redis';
 
 import {
   defineDAINService,
@@ -9,47 +10,83 @@ import {
   ServiceContext,
 } from "@dainprotocol/service-sdk";
 
-const getParclId = async (location: string) => {
-  interface ParclMarket {
-    parcl_id: string;
-    country: string;
-    geoid: string;
-    state_fips_code: string;
-    name: string;
-    state_abbreviation: string;
-    region: string;
-    location_type: string;
-    total_population: number;
-    median_income: number;
-    parcl_exchange_market: number;
-    pricefeed_market: number;
-    case_shiller_10_market: number;
-    case_shiller_20_market: number;
-  }
+// Initialize Redis client
+const redisClient = createClient({
+  url: process.env.REDIS_URL || 'redis://localhost:6379'
+});
 
-  const locquery: string = location.replace(/ /g, "%20");
+redisClient.connect().catch(console.error);
+
+// Add cache wrapper function
+async function withCache<T>(
+  key: string,
+  ttlSeconds: number,
+  fetchFn: () => Promise<T>
+): Promise<T> {
   try {
-    const options = {
-      method: "GET",
-      url: `https://api.parcllabs.com/v1/search/markets?query=${locquery}`,
-      headers: {
-        accept: "application/json",
-        Authorization: process.env.PARCL_API_KEY,
-      },
-    };
+    // Try to get from cache
+    const cached = await redisClient.get(key);
+    if (cached) {
+      return JSON.parse(cached);
+    }
+    // If not in cache, fetch data
+    const data = await fetchFn();
+    // Store in cache
+    await redisClient.setEx(key, ttlSeconds, JSON.stringify(data));
+    
+    return data;
+  } catch (error) {
+    console.error('Cache error:', error);
+    // Fallback to direct fetch if cache fails
+    return fetchFn();
+  }
+}
 
-    const response = await axios.request(options);
-    const markets: ParclMarket[] = response.data.items;
-
-    if (!markets.length) {
-      throw new Error("No markets found for the given location");
+const getParclId = async (location: string) => {
+  const cacheKey = `parcl_id:${location}`;
+  // Cache ParclId for 24 hours as it rarely changes
+  return withCache(cacheKey, 24 * 60 * 60, async () => {
+    interface ParclMarket {
+      parcl_id: string;
+      country: string;
+      geoid: string;
+      state_fips_code: string;
+      name: string;
+      state_abbreviation: string;
+      region: string;
+      location_type: string;
+      total_population: number;
+      median_income: number;
+      parcl_exchange_market: number;
+      pricefeed_market: number;
+      case_shiller_10_market: number;
+      case_shiller_20_market: number;
     }
 
-    return markets[0].parcl_id;
-  } catch (err) {
-    console.error(err);
-    throw err;
-  }
+    const locquery: string = location.replace(/ /g, "%20");
+    try {
+      const options = {
+        method: "GET",
+        url: `https://api.parcllabs.com/v1/search/markets?query=${locquery}`,
+        headers: {
+          accept: "application/json",
+          Authorization: process.env.PARCL_API_KEY,
+        },
+      };
+
+      const response = await axios.request(options);
+      const markets: ParclMarket[] = response.data.items;
+
+      if (!markets.length) {
+        throw new Error("No markets found for the given location");
+      }
+
+      return markets[0].parcl_id;
+    } catch (err) {
+      console.error(err);
+      throw err;
+    }
+  });
 };
 
 const getPricePerSqFt: ToolConfig = {
@@ -69,118 +106,122 @@ const getPricePerSqFt: ToolConfig = {
   }),
   pricing: { pricePerUse: 0, currency: "USD" },
   handler: async ({ location }, agentInfo) => {
-    console.log(
-      `Agent ${agentInfo.agentId} requested per sq.ft property price for ${location}.`
-    );
-    const parclId = await getParclId(location);
+    const cacheKey = `price_feed:${location}`;
+    // Cache price feed for 1 hour
+    return withCache(cacheKey, 24 * 60 * 60, async () => {
+      console.log(
+        `Agent ${agentInfo.agentId} requested per sq.ft property price for ${location}.`
+      );
+      const parclId = await getParclId(location);
 
-    const options = {
-      method: "GET",
-      url: `https://api.parcllabs.com/v1/price_feed/${parclId}/price_feed?limit=731`,
-      headers: {
-        accept: "application/json",
-        Authorization: process.env.PARCL_API_KEY,
-      },
-    };
+      const options = {
+        method: "GET",
+        url: `https://api.parcllabs.com/v1/price_feed/${parclId}/price_feed?limit=731`,
+        headers: {
+          accept: "application/json",
+          Authorization: process.env.PARCL_API_KEY,
+        },
+      };
 
-    const response = await axios.request(options);
-    const feed = response.data.items;
+      const response = await axios.request(options);
+      const feed = response.data.items;
 
-    const currentPrice = feed[0].price_feed;
-    const onemonthPrice = feed[31].price_feed;
-    const twomonthPrice = feed[61].price_feed;
-    const threemonthPrice = feed[91].price_feed;
-    const sixmonthPrice = feed[182].price_feed;
-    const oneyearPrice = feed[365].price_feed;
-    const twoyearPrice = feed[730].price_feed;
+      const currentPrice = feed[0].price_feed;
+      const onemonthPrice = feed[31].price_feed;
+      const twomonthPrice = feed[61].price_feed;
+      const threemonthPrice = feed[91].price_feed;
+      const sixmonthPrice = feed[182].price_feed;
+      const oneyearPrice = feed[365].price_feed;
+      const twoyearPrice = feed[730].price_feed;
 
-    const monthOverMonthChange = Number(((currentPrice - onemonthPrice) / onemonthPrice * 100).toFixed(3));
-    const twoMonthChange = Number(((currentPrice - twomonthPrice) / twomonthPrice * 100).toFixed(3));
-    const threeMonthChange = Number(((currentPrice - threemonthPrice) / threemonthPrice * 100).toFixed(3));
-    const sixMonthChange = Number(((currentPrice - sixmonthPrice) / sixmonthPrice * 100).toFixed(3));
+      const monthOverMonthChange = Number(((currentPrice - onemonthPrice) / onemonthPrice * 100).toFixed(3));
+      const twoMonthChange = Number(((currentPrice - twomonthPrice) / twomonthPrice * 100).toFixed(3));
+      const threeMonthChange = Number(((currentPrice - threemonthPrice) / threemonthPrice * 100).toFixed(3));
+      const sixMonthChange = Number(((currentPrice - sixmonthPrice) / sixmonthPrice * 100).toFixed(3));
 
-    const yearOverYearChange = Number(((currentPrice - oneyearPrice) / oneyearPrice * 100).toFixed(3));
-    const twoYearChange = Number(((currentPrice - twoyearPrice) / twoyearPrice * 100).toFixed(3));
+      const yearOverYearChange = Number(((currentPrice - oneyearPrice) / oneyearPrice * 100).toFixed(3));
+      const twoYearChange = Number(((currentPrice - twoyearPrice) / twoyearPrice * 100).toFixed(3));
 
-    const shortTermMomentum = Number((monthOverMonthChange / 1).toFixed(3));  // Monthly rate
-    const mediumTermMomentum = Number((threeMonthChange / 3).toFixed(3));     // Quarterly rate
-    const longTermMomentum = Number((yearOverYearChange / 12).toFixed(3));    // Monthly rate over year
+      const shortTermMomentum = Number((monthOverMonthChange / 1).toFixed(3));  // Monthly rate
+      const mediumTermMomentum = Number((threeMonthChange / 3).toFixed(3));     // Quarterly rate
+      const longTermMomentum = Number((yearOverYearChange / 12).toFixed(3));    // Monthly rate over year
 
-    const velocityMonthly = Number((monthOverMonthChange - twoMonthChange).toFixed(3));
-    const velocityQuarterly = Number((threeMonthChange - sixMonthChange).toFixed(3));
+      const velocityMonthly = Number((monthOverMonthChange - twoMonthChange).toFixed(3));
+      const velocityQuarterly = Number((threeMonthChange - sixMonthChange).toFixed(3));
 
-    const seasonalVariation = Number(((currentPrice - oneyearPrice) / oneyearPrice * 100).toFixed(3));
+      const seasonalVariation = Number(((currentPrice - oneyearPrice) / oneyearPrice * 100).toFixed(3));
 
-    return {
-      text: `The current price of property per square foot in ${location} is ${currentPrice}`,
-      data: { pricepersqft: currentPrice },
-      ui: {
-        type: "statsGrid",
-        uiData: JSON.stringify({
-          stats: [
-            {
-              title: "Current Price",
-              value: currentPrice,
-              description: "The current price of property per square foot",
-            },
-            {
-              title: "Earlier Price (1 month ago)",
-              value: onemonthPrice,
-              change: monthOverMonthChange,
-              description: "The price of property per square foot 1 month ago",
-            },
-            {
-              title: "Earlier Price (6 months ago)",
-              value: sixmonthPrice,
-              change: sixMonthChange,
-              description: "The price of property per square foot 6 months ago",
-            },
-            {
-              title: "Earlier Price (1 year ago)",
-              value: oneyearPrice,
-              change: yearOverYearChange,
-              description: "The price of property per square foot 1 year ago",
-            },
-            {
-              title: "Earlier Price (2 years ago)",
-              value: twoyearPrice,
-              change: twoYearChange,
-              description: "The price of property per square foot 2 years ago",
-            },
-            {
-              title: "Short Term Momentum",
-              value: `${shortTermMomentum}%`,
-              description: "Monthly rate of price change (1 month)",
-            },
-            {
-              title: "Medium Term Momentum", 
-              value: `${mediumTermMomentum}%`,
-              description: "Average monthly rate of price change over 3 months",
-            },
-            {
-              title: "Long Term Momentum",
-              value: `${longTermMomentum}%`, 
-              description: "Average monthly rate of price change over 1 year",
-            },
-            {
-              title: "Velocity Monthly",
-              value: `${velocityMonthly}%`,
-              description: "Monthly change in price momentum",
-            },
-            {
-              title: "Velocity Quarterly",
-              value: `${velocityQuarterly}%`,
-              description: "Quarterly change in price momentum",
-            },
-            {
-              title: "Seasonal Variation",
-              value: seasonalVariation,
-              description: "Seasonal variation in price",
-            },
-          ]
-        })
-      },
-    };
+      return {
+        text: `The current price of property per square foot in ${location} is ${currentPrice}`,
+        data: { pricepersqft: currentPrice },
+        ui: {
+          type: "statsGrid",
+          uiData: JSON.stringify({
+            stats: [
+              {
+                title: "Current Price",
+                value: currentPrice,
+                description: "The current price of property per square foot",
+              },
+              {
+                title: "Earlier Price (1 month ago)",
+                value: onemonthPrice,
+                change: monthOverMonthChange,
+                description: "The price of property per square foot 1 month ago",
+              },
+              {
+                title: "Earlier Price (6 months ago)",
+                value: sixmonthPrice,
+                change: sixMonthChange,
+                description: "The price of property per square foot 6 months ago",
+              },
+              {
+                title: "Earlier Price (1 year ago)",
+                value: oneyearPrice,
+                change: yearOverYearChange,
+                description: "The price of property per square foot 1 year ago",
+              },
+              {
+                title: "Earlier Price (2 years ago)",
+                value: twoyearPrice,
+                change: twoYearChange,
+                description: "The price of property per square foot 2 years ago",
+              },
+              {
+                title: "Short Term Momentum",
+                value: `${shortTermMomentum}%`,
+                description: "Monthly rate of price change (1 month)",
+              },
+              {
+                title: "Medium Term Momentum", 
+                value: `${mediumTermMomentum}%`,
+                description: "Average monthly rate of price change over 3 months",
+              },
+              {
+                title: "Long Term Momentum",
+                value: `${longTermMomentum}%`, 
+                description: "Average monthly rate of price change over 1 year",
+              },
+              {
+                title: "Velocity Monthly",
+                value: `${velocityMonthly}%`,
+                description: "Monthly change in price momentum",
+              },
+              {
+                title: "Velocity Quarterly",
+                value: `${velocityQuarterly}%`,
+                description: "Quarterly change in price momentum",
+              },
+              {
+                title: "Seasonal Variation",
+                value: seasonalVariation,
+                description: "Seasonal variation in price",
+              },
+            ]
+          })
+        },
+      };
+    });
   },
 };
 
@@ -199,118 +240,122 @@ const getRentalPricePerSqFt: ToolConfig = {
   }),
   pricing: { pricePerUse: 0, currency: "USD" },
   handler: async ({ location }, agentInfo) => {
-    console.log(
-      `Agent ${agentInfo.agentId} requested per sq.ft rental property price for ${location}.`
-    );
-    const parclId = await getParclId(location);
+    const cacheKey = `rental_price_feed:${location}`;
+    // Cache rental price feed for 1 hour
+    return withCache(cacheKey, 24 * 60 * 60, async () => {
+      console.log(
+        `Agent ${agentInfo.agentId} requested per sq.ft rental property price for ${location}.`
+      );
+      const parclId = await getParclId(location);
 
-    const options = {
-      method: "GET",
-      url: `https://api.parcllabs.com/v1/price_feed/${parclId}/rental_price_feed?limit=731`,
-      headers: {
-        accept: "application/json",
-        Authorization: process.env.PARCL_API_KEY,
-      },
-    };
+      const options = {
+        method: "GET",
+        url: `https://api.parcllabs.com/v1/price_feed/${parclId}/rental_price_feed?limit=731`,
+        headers: {
+          accept: "application/json",
+          Authorization: process.env.PARCL_API_KEY,
+        },
+      };
 
-    const response = await axios.request(options);
-    const feed = response.data.items;
+      const response = await axios.request(options);
+      const feed = response.data.items;
 
-    const currentPrice = feed[0].rental_price_feed;
-    const onemonthPrice = feed[31].rental_price_feed;
-    const twomonthPrice = feed[61].rental_price_feed;
-    const threemonthPrice = feed[91].rental_price_feed;
-    const sixmonthPrice = feed[182].rental_price_feed;
-    const oneyearPrice = feed[365].rental_price_feed;
-    const twoyearPrice = feed[730].rental_price_feed;
+      const currentPrice = feed[0].rental_price_feed;
+      const onemonthPrice = feed[31].rental_price_feed;
+      const twomonthPrice = feed[61].rental_price_feed;
+      const threemonthPrice = feed[91].rental_price_feed;
+      const sixmonthPrice = feed[182].rental_price_feed;
+      const oneyearPrice = feed[365].rental_price_feed;
+      const twoyearPrice = feed[730].rental_price_feed;
 
-    const monthOverMonthChange = Number(((currentPrice - onemonthPrice) / onemonthPrice * 100).toFixed(3));
-    const twoMonthChange = Number(((currentPrice - twomonthPrice) / twomonthPrice * 100).toFixed(3));
-    const threeMonthChange = Number(((currentPrice - threemonthPrice) / threemonthPrice * 100).toFixed(3));
-    const sixMonthChange = Number(((currentPrice - sixmonthPrice) / sixmonthPrice * 100).toFixed(3));
+      const monthOverMonthChange = Number(((currentPrice - onemonthPrice) / onemonthPrice * 100).toFixed(3));
+      const twoMonthChange = Number(((currentPrice - twomonthPrice) / twomonthPrice * 100).toFixed(3));
+      const threeMonthChange = Number(((currentPrice - threemonthPrice) / threemonthPrice * 100).toFixed(3));
+      const sixMonthChange = Number(((currentPrice - sixmonthPrice) / sixmonthPrice * 100).toFixed(3));
 
-    const yearOverYearChange = Number(((currentPrice - oneyearPrice) / oneyearPrice * 100).toFixed(3));
-    const twoYearChange = Number(((currentPrice - twoyearPrice) / twoyearPrice * 100).toFixed(3));
+      const yearOverYearChange = Number(((currentPrice - oneyearPrice) / oneyearPrice * 100).toFixed(3));
+      const twoYearChange = Number(((currentPrice - twoyearPrice) / twoyearPrice * 100).toFixed(3));
 
-    const shortTermMomentum = Number((monthOverMonthChange / 1).toFixed(3));  // Monthly rate
-    const mediumTermMomentum = Number((threeMonthChange / 3).toFixed(3));     // Quarterly rate
-    const longTermMomentum = Number((yearOverYearChange / 12).toFixed(3));    // Monthly rate over year
+      const shortTermMomentum = Number((monthOverMonthChange / 1).toFixed(3));  // Monthly rate
+      const mediumTermMomentum = Number((threeMonthChange / 3).toFixed(3));     // Quarterly rate
+      const longTermMomentum = Number((yearOverYearChange / 12).toFixed(3));    // Monthly rate over year
 
-    const velocityMonthly = Number((monthOverMonthChange - twoMonthChange).toFixed(3));
-    const velocityQuarterly = Number((threeMonthChange - sixMonthChange).toFixed(3));
+      const velocityMonthly = Number((monthOverMonthChange - twoMonthChange).toFixed(3));
+      const velocityQuarterly = Number((threeMonthChange - sixMonthChange).toFixed(3));
 
-    const seasonalVariation = Number(((currentPrice - oneyearPrice) / oneyearPrice * 100).toFixed(3));
+      const seasonalVariation = Number(((currentPrice - oneyearPrice) / oneyearPrice * 100).toFixed(3));
 
-    return {
-      text: `The current rental price of property per square foot in ${location} is ${currentPrice}`,
-      data: { rentalpricepersqft: currentPrice },
-      ui: {
-        type: "statsGrid",
-        uiData: JSON.stringify({
-          stats: [
-            {
-              title: "Current Price",
-              value: currentPrice,
-              description: "The current rental price of property per square foot",
-            },
-            {
-              title: "Earlier Price (1 month ago)",
-              value: onemonthPrice,
-              change: monthOverMonthChange,
-              description: "The rental price of property per square foot 1 month ago",
-            },
-            {
-              title: "Earlier Price (6 months ago)",
-              value: sixmonthPrice,
-              change: sixMonthChange,
-              description: "The rental price of property per square foot 6 months ago",
-            },
-            {
-              title: "Earlier Price (1 year ago)",
-              value: oneyearPrice,
-              change: yearOverYearChange,
-              description: "The rental price of property per square foot 1 year ago",
-            },
-            {
-              title: "Earlier Price (2 years ago)",
-              value: twoyearPrice,
-              change: twoYearChange,
-              description: "The rental price of property per square foot 2 years ago",
-            },
-            {
-              title: "Short Term Momentum",
-              value: `${shortTermMomentum}%`,
-              description: "Monthly rate of rental price change (1 month)",
-            },
-            {
-              title: "Medium Term Momentum", 
-              value: `${mediumTermMomentum}%`,
-              description: "Average monthly rate of rental price change over 3 months",
-            },
-            {
-              title: "Long Term Momentum",
-              value: `${longTermMomentum}%`, 
-              description: "Average monthly rate of rental price change over 1 year",
-            },
-            {
-              title: "Velocity Monthly",
-              value: `${velocityMonthly}%`,
-              description: "Monthly change in rental price momentum",
-            },
-            {
-              title: "Velocity Quarterly",
-              value: `${velocityQuarterly}%`,
-              description: "Quarterly change in rental price momentum",
-            },
-            {
-              title: "Seasonal Variation",
-              value: seasonalVariation,
-              description: "Seasonal variation in rental price",
-            },
-          ]
-        })
-      },
-    };
+      return {
+        text: `The current rental price of property per square foot in ${location} is ${currentPrice}`,
+        data: { rentalpricepersqft: currentPrice },
+        ui: {
+          type: "statsGrid",
+          uiData: JSON.stringify({
+            stats: [
+              {
+                title: "Current Price",
+                value: currentPrice,
+                description: "The current rental price of property per square foot",
+              },
+              {
+                title: "Earlier Price (1 month ago)",
+                value: onemonthPrice,
+                change: monthOverMonthChange,
+                description: "The rental price of property per square foot 1 month ago",
+              },
+              {
+                title: "Earlier Price (6 months ago)",
+                value: sixmonthPrice,
+                change: sixMonthChange,
+                description: "The rental price of property per square foot 6 months ago",
+              },
+              {
+                title: "Earlier Price (1 year ago)",
+                value: oneyearPrice,
+                change: yearOverYearChange,
+                description: "The rental price of property per square foot 1 year ago",
+              },
+              {
+                title: "Earlier Price (2 years ago)",
+                value: twoyearPrice,
+                change: twoYearChange,
+                description: "The rental price of property per square foot 2 years ago",
+              },
+              {
+                title: "Short Term Momentum",
+                value: `${shortTermMomentum}%`,
+                description: "Monthly rate of rental price change (1 month)",
+              },
+              {
+                title: "Medium Term Momentum", 
+                value: `${mediumTermMomentum}%`,
+                description: "Average monthly rate of rental price change over 3 months",
+              },
+              {
+                title: "Long Term Momentum",
+                value: `${longTermMomentum}%`, 
+                description: "Average monthly rate of rental price change over 1 year",
+              },
+              {
+                title: "Velocity Monthly",
+                value: `${velocityMonthly}%`,
+                description: "Monthly change in rental price momentum",
+              },
+              {
+                title: "Velocity Quarterly",
+                value: `${velocityQuarterly}%`,
+                description: "Quarterly change in rental price momentum",
+              },
+              {
+                title: "Seasonal Variation",
+                value: seasonalVariation,
+                description: "Seasonal variation in rental price",
+              },
+            ]
+          })
+        },
+      };
+    });
   },
 };
 
@@ -332,4 +377,10 @@ const dainService = defineDAINService({
 
 dainService.startNode({ port: 2022 }).then(() => {
   console.log("Real Estate Market DAIN Service is running on port 2022");
+});
+
+// Add graceful shutdown
+process.on('SIGTERM', async () => {
+  await redisClient.quit();
+  process.exit(0);
 });
