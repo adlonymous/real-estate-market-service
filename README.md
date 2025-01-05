@@ -6,7 +6,7 @@ A DAIN Service AI Agent that extracts highly accurate and precise Real Estate ma
 - Node.js
 - DAIN Service SDK
 - Parcl Labs API
-- Redis (soon)
+- Redis 
 
 ## DAIN Tools
 - Price per sq feet Feed
